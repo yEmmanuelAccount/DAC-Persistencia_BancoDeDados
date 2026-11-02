@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "tsx scripts/clean.ts",
+    "test": "node --import tsx --test test/**/*.test.ts",
     "start": "node dist/main.js",
     "dev": "tsx src/main.ts",
     "watch": "tsx watch src/main.ts"

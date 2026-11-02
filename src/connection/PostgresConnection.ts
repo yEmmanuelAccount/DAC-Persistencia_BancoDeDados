@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
-import type { PreparedOperation, Row, TableDefinition, TwoPhaseParticipant } from '../types.js';
+import type { ColumnSelection, PreparedOperation, Row, TableDefinition, TwoPhaseParticipant } from '../types.js';
 
 const SHADOW_PREFIX = 'twopc_shadow_';
 const LOCK_COLUMN = '__twopc_lock_tx_id';
@@ -20,6 +20,14 @@ const sqlType = (type: TableDefinition['columns'][string]): string => ({
   boolean: 'BOOLEAN',
 }[type]);
 
+const selectedColumns = (table: TableDefinition, columns?: ColumnSelection): string[] => {
+  const selected = columns ? [...columns] : Object.keys(table.columns);
+  for (const column of selected) {
+    if (!table.columns[column]) throw new Error(`Unknown column ${column} on ${table.name}`);
+  }
+  return selected;
+};
+
 export class PostgresConnection implements TwoPhaseParticipant {
   private readonly pool: Pool;
 
@@ -28,6 +36,10 @@ export class PostgresConnection implements TwoPhaseParticipant {
   }
 
   async initialize(): Promise<void> {
+    await this.pool.query('SELECT 1');
+  }
+
+  async cleanupOrphanShadows(): Promise<void> {
     const result = await this.pool.query(
       'SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE $1',
       [`${SHADOW_PREFIX}%`],
@@ -105,21 +117,23 @@ export class PostgresConnection implements TwoPhaseParticipant {
       const columns = Object.keys(staged).filter((column) => !column.startsWith('__twopc_'));
       const values = columns.map((column) => staged[column]);
       if (staged.__twopc_operation === 'insert') {
+        const updateColumns = columns.filter((column) => column !== keyColumn);
+        const conflictUpdates = updateColumns.map((column) => `${quoteIdentifier(column)} = EXCLUDED.${quoteIdentifier(column)}`);
         await this.pool.query(
-          `INSERT INTO ${quoteIdentifier(table)} (${columns.map(quoteIdentifier).join(', ')}, ${quoteIdentifier(LOCK_COLUMN)}) VALUES (${values.map((_, index) => `$${index + 1}`).join(', ')}, NULL)`,
+          `INSERT INTO ${quoteIdentifier(table)} (${columns.map(quoteIdentifier).join(', ')}, ${quoteIdentifier(LOCK_COLUMN)}) VALUES (${values.map((_, index) => `$${index + 1}`).join(', ')}, NULL) ON CONFLICT (${quoteIdentifier(keyColumn)}) DO UPDATE SET ${[...conflictUpdates, `${quoteIdentifier(LOCK_COLUMN)} = NULL`].join(', ')}`,
           values,
         );
       } else if (staged.__twopc_operation === 'update') {
         const updateColumns = columns.filter((column) => column !== keyColumn);
         const updates = updateColumns.map((column, index) => `${quoteIdentifier(column)} = $${index + 1}`);
         await this.pool.query(
-          `UPDATE ${quoteIdentifier(table)} SET ${updates.join(', ')}, ${quoteIdentifier(LOCK_COLUMN)} = NULL WHERE ${quoteIdentifier(keyColumn)} = $${updates.length + 1} AND ${quoteIdentifier(LOCK_COLUMN)} = $${updates.length + 2}`,
-          [...updateColumns.map((column) => staged[column]), staged[keyColumn], transactionId],
+          `UPDATE ${quoteIdentifier(table)} SET ${updates.join(', ')}, ${quoteIdentifier(LOCK_COLUMN)} = NULL WHERE ${quoteIdentifier(keyColumn)} = $${updates.length + 1}`,
+          [...updateColumns.map((column) => staged[column]), staged[keyColumn]],
         );
       } else {
         await this.pool.query(
-          `DELETE FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(keyColumn)} = $1 AND ${quoteIdentifier(LOCK_COLUMN)} = $2`,
-          [staged[keyColumn], transactionId],
+          `DELETE FROM ${quoteIdentifier(table)} WHERE ${quoteIdentifier(keyColumn)} = $1`,
+          [staged[keyColumn]],
         );
       }
     }
@@ -138,8 +152,8 @@ export class PostgresConnection implements TwoPhaseParticipant {
     await this.pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier(shadow)}`);
   }
 
-  async read(table: TableDefinition, key: string): Promise<Row | null> {
-    const columns = Object.keys(table.columns).map(quoteIdentifier).join(', ');
+  async read(table: TableDefinition, key: string, requestedColumns?: ColumnSelection): Promise<Row | null> {
+    const columns = selectedColumns(table, requestedColumns).map(quoteIdentifier).join(', ');
     const result = await this.pool.query(`SELECT ${columns} FROM ${quoteIdentifier(table.name)} WHERE ${quoteIdentifier(table.keyColumn)} = $1`, [key]);
     return result.rows[0] ?? null;
   }

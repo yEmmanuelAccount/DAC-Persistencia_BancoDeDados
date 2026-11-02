@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { MongoClient, type Collection, type Db } from 'mongodb';
-import type { PreparedOperation, Row, TableDefinition, TwoPhaseParticipant } from '../types.js';
+import type { ColumnSelection, PreparedOperation, Row, TableDefinition, TwoPhaseParticipant } from '../types.js';
 
 type MongoRow = Row & { __twopc_lock_tx_id?: string | null };
 
@@ -33,6 +33,9 @@ export class MongoConnection implements TwoPhaseParticipant {
   async initialize(): Promise<void> {
     await this.client.connect();
     this.database = this.client.db(this.databaseName);
+  }
+
+  async cleanupOrphanShadows(): Promise<void> {
     const collections = await this.database.listCollections({ name: { $regex: `^${SHADOW_PREFIX}` } }).toArray();
     for (const collection of collections) await this.database.collection(collection.name).drop();
     const dataCollections = await this.database.listCollections({ name: { $not: { $regex: `^${SHADOW_PREFIX}` } } }).toArray();
@@ -76,11 +79,11 @@ export class MongoConnection implements TwoPhaseParticipant {
     for (const record of records) {
       const collection = this.database.collection<MongoRow>(record.table);
       if (record.operation === 'insert') {
-        await collection.insertOne({ ...record.row });
+        await collection.replaceOne({ [record.keyColumn]: record.key }, { ...record.row }, { upsert: true });
       } else if (record.operation === 'update') {
-        await collection.replaceOne({ [record.keyColumn]: record.key, [LOCK_FIELD]: transactionId }, { ...record.row });
+        await collection.replaceOne({ [record.keyColumn]: record.key }, { ...record.row });
       } else {
-        await collection.deleteOne({ [record.keyColumn]: record.key, [LOCK_FIELD]: transactionId });
+        await collection.deleteOne({ [record.keyColumn]: record.key });
       }
     }
     await this.database.collection(shadowName(transactionId)).drop().catch(() => undefined);
@@ -94,8 +97,14 @@ export class MongoConnection implements TwoPhaseParticipant {
     await this.database.collection(shadowName(transactionId)).drop().catch(() => undefined);
   }
 
-  async read(table: TableDefinition, key: string): Promise<Row | null> {
-    const row = await this.database.collection<MongoRow>(table.name).findOne({ [table.keyColumn]: key }, { projection: { [LOCK_FIELD]: 0, _id: 0 } });
+  async read(table: TableDefinition, key: string, requestedColumns?: ColumnSelection): Promise<Row | null> {
+    const columns = requestedColumns ?? Object.keys(table.columns);
+    for (const column of columns) {
+      if (!table.columns[column]) throw new Error(`Unknown column ${column} on ${table.name}`);
+    }
+    const projection = Object.fromEntries(columns.map((column) => [column, 1]));
+    projection._id = 0;
+    const row = await this.database.collection<MongoRow>(table.name).findOne({ [table.keyColumn]: key }, { projection });
     return row;
   }
 

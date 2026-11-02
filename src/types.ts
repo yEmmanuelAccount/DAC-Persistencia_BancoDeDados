@@ -8,7 +8,11 @@ export type TableDefinition = {
 
 export type Row = Record<string, string | number | boolean | null>;
 
+export type ColumnSelection = readonly string[];
+
 export type Operation = 'insert' | 'update' | 'delete';
+
+export type ReadMode = 'blocking' | 'mvcc';
 
 export type PreparedOperation = {
   transactionId: string;
@@ -21,10 +25,11 @@ export type PreparedOperation = {
 export interface TwoPhaseParticipant {
   initialize(): Promise<void>;
   createTable(table: TableDefinition): Promise<void>;
+  cleanupOrphanShadows(): Promise<void>;
   prepare(operation: PreparedOperation): Promise<void>;
   commit(transactionId: string): Promise<void>;
   rollback(transactionId: string): Promise<void>;
-  read(table: TableDefinition, key: string): Promise<Row | null>;
+  read(table: TableDefinition, key: string, columns?: ColumnSelection): Promise<Row | null>;
   readAll(table: TableDefinition): Promise<Row[]>;
   close(): Promise<void>;
 }
